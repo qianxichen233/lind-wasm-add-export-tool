@@ -1,131 +1,231 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::{env, fs};
 use wasm_encoder::{ExportKind, ExportSection, Module, RawSection};
-use wasmparser::{KnownCustom, Name, Parser, Payload};
+use wasmparser::{ExternalKind, KnownCustom, Name, Parser, Payload};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetKind {
+    Func,
+    Global,
+}
+
+#[derive(Clone, Copy)]
+enum EmittedSection<'a> {
+    Raw { id: u8, data: &'a [u8] },
+    NewExport,
+}
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
 
-    let input = args
-        .next()
-        .context("usage: add-wasm-export-by-name <in.wasm> <out.wasm> <export-name> <func-name>")?;
-    let output = args
-        .next()
-        .context("usage: add-wasm-export-by-name <in.wasm> <out.wasm> <export-name> <func-name>")?;
-    let export_name = args
-        .next()
-        .context("usage: add-wasm-export-by-name <in.wasm> <out.wasm> <export-name> <func-name>")?;
-    let func_name = args
-        .next()
-        .context("usage: add-wasm-export-by-name <in.wasm> <out.wasm> <export-name> <func-name>")?;
+    let input = args.next().context(
+        "usage: add-wasm-export <in.wasm> <out.wasm> <export-name> <func|global> <target-name>",
+    )?;
+    let output = args.next().context(
+        "usage: add-wasm-export <in.wasm> <out.wasm> <export-name> <func|global> <target-name>",
+    )?;
+    let export_name = args.next().context(
+        "usage: add-wasm-export <in.wasm> <out.wasm> <export-name> <func|global> <target-name>",
+    )?;
+    let kind = parse_target_kind(
+        &args.next().context(
+            "usage: add-wasm-export <in.wasm> <out.wasm> <export-name> <func|global> <target-name>",
+        )?,
+    )?;
+    let target_name = args.next().context(
+        "usage: add-wasm-export <in.wasm> <out.wasm> <export-name> <func|global> <target-name>",
+    )?;
 
     let wasm = fs::read(&input).with_context(|| format!("failed to read {input}"))?;
 
-    let func_index = find_function_index_by_name(&wasm, &func_name)
-        .with_context(|| format!("could not find function name {func_name:?} in name section"))?;
+    let target_index = find_named_target(&wasm, kind, &target_name)
+        .with_context(|| format!("could not find {kind:?} named {target_name:?}"))?;
 
-    let new_wasm = add_func_export(&wasm, &export_name, func_index)?;
-    wasmparser::validate(&new_wasm).context("rewritten wasm is invalid")?;
+    let rewritten = add_export(&wasm, &export_name, kind, target_index)?;
+    wasmparser::validate(&rewritten).context("rewritten wasm is invalid")?;
 
-    fs::write(&output, new_wasm).with_context(|| format!("failed to write {output}"))?;
+    fs::write(&output, rewritten).with_context(|| format!("failed to write {output}"))?;
+
     println!(
-        "added export {:?} -> function {:?} (index {})",
-        export_name, func_name, func_index
+        "added export {:?} -> {:?} {:?} (index {})",
+        export_name, kind, target_name, target_index
     );
 
     Ok(())
 }
 
-fn find_function_index_by_name(wasm: &[u8], wanted: &str) -> Result<u32> {
+fn parse_target_kind(s: &str) -> Result<TargetKind> {
+    match s {
+        "func" | "function" => Ok(TargetKind::Func),
+        "global" => Ok(TargetKind::Global),
+        _ => bail!("kind must be 'func' or 'global'"),
+    }
+}
+
+fn export_kind(kind: TargetKind) -> ExportKind {
+    match kind {
+        TargetKind::Func => ExportKind::Func,
+        TargetKind::Global => ExportKind::Global,
+    }
+}
+
+fn map_external_kind(kind: ExternalKind) -> Option<ExportKind> {
+    match kind {
+        ExternalKind::Func => Some(ExportKind::Func),
+        ExternalKind::Table => Some(ExportKind::Table),
+        ExternalKind::Memory => Some(ExportKind::Memory),
+        ExternalKind::Global => Some(ExportKind::Global),
+        ExternalKind::Tag => Some(ExportKind::Tag),
+        _ => None,
+    }
+}
+
+fn find_named_target(wasm: &[u8], wanted_kind: TargetKind, wanted_name: &str) -> Result<u32> {
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
             Payload::CustomSection(section) => {
-                match section.as_known() {
-                    KnownCustom::Name(names) => {
-                        for subsection in names {
-                            match subsection? {
-                                Name::Function(map) => {
-                                    for naming in map {
-                                        let naming = naming?;
-                                        if naming.name == wanted {
-                                            return Ok(naming.index);
-                                        }
+                if let KnownCustom::Name(names) = section.as_known() {
+                    for subsection in names {
+                        match subsection? {
+                            Name::Function(map) if wanted_kind == TargetKind::Func => {
+                                for naming in map {
+                                    let naming = naming?;
+                                    if naming.name == wanted_name {
+                                        return Ok(naming.index);
                                     }
                                 }
-                                _ => {}
                             }
+                            Name::Global(map) if wanted_kind == TargetKind::Global => {
+                                for naming in map {
+                                    let naming = naming?;
+                                    if naming.name == wanted_name {
+                                        return Ok(naming.index);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    _ => {}
                 }
             }
             _ => {}
         }
     }
 
-    bail!("function name not found in name section")
+    bail!("target name not found in name section")
 }
 
-fn add_func_export(wasm: &[u8], export_name: &str, func_index: u32) -> Result<Vec<u8>> {
-    let mut module = Module::new();
-    let mut found_export_section = false;
+fn add_export(
+    wasm: &[u8],
+    export_name: &str,
+    new_kind: TargetKind,
+    new_index: u32,
+) -> Result<Vec<u8>> {
+    let mut emitted: Vec<EmittedSection<'_>> = Vec::new();
+
+    let mut saw_export = false;
+    let mut inserted_new_export = false;
+
+    let mut rebuilt_exports = ExportSection::new();
+    let mut existing_export_name_present = false;
+
     let mut code_section_start: Option<usize> = None;
     let mut code_section_end: Option<usize> = None;
 
     for payload in Parser::new(0).parse_all(wasm) {
-        match payload? {
-            Payload::Version { .. } => {}
+        let payload = payload?;
+
+        if !saw_export && !inserted_new_export && should_insert_export_before(&payload) {
+            emitted.push(EmittedSection::NewExport);
+            inserted_new_export = true;
+        }
+
+        match payload {
+            Payload::Version { .. } | Payload::End(_) => {}
 
             Payload::TypeSection(s) => {
-                module.section(&RawSection {
-                    id: wasm_encoder::SectionId::Type.into(),
-                    data: s.range().slice(wasm),
-                });
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Type.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
             }
 
             Payload::ImportSection(s) => {
-                module.section(&RawSection {
-                    id: wasm_encoder::SectionId::Import.into(),
-                    data: s.range().slice(wasm),
-                });
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Import.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
             }
 
             Payload::FunctionSection(s) => {
-                module.section(&RawSection {
-                    id: wasm_encoder::SectionId::Function.into(),
-                    data: s.range().slice(wasm),
-                });
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Function.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
+            }
+
+            Payload::TableSection(s) => {
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Table.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
+            }
+
+            Payload::MemorySection(s) => {
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Memory.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
+            }
+
+            Payload::GlobalSection(s) => {
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Global.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
             }
 
             Payload::ExportSection(s) => {
-                found_export_section = true;
-
-                let mut new_exports = ExportSection::new();
-                let mut already_present = false;
+                saw_export = true;
 
                 for export in s {
                     let export = export?;
-                    let kind = match export.kind {
-                        wasmparser::ExternalKind::Func => ExportKind::Func,
-                        wasmparser::ExternalKind::Table => ExportKind::Table,
-                        wasmparser::ExternalKind::Memory => ExportKind::Memory,
-                        wasmparser::ExternalKind::Global => ExportKind::Global,
-                        wasmparser::ExternalKind::Tag => ExportKind::Tag,
-                        wasmparser::ExternalKind::FuncExact => ExportKind::Func,
-                    };
+                    let kind = map_external_kind(export.kind)
+                        .context("unsupported existing export kind")?;
 
                     if export.name == export_name {
-                        already_present = true;
+                        existing_export_name_present = true;
                     }
 
-                    new_exports.export(export.name, kind, export.index);
+                    rebuilt_exports.export(export.name, kind, export.index);
                 }
 
-                if !already_present {
-                    new_exports.export(export_name, ExportKind::Func, func_index);
+                if !existing_export_name_present {
+                    rebuilt_exports.export(export_name, export_kind(new_kind), new_index);
                 }
 
-                module.section(&new_exports);
+                emitted.push(EmittedSection::NewExport);
+            }
+
+            Payload::StartSection { range, .. } => {
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Start.into(),
+                    &wasm[range.start..range.end],
+                ));
+            }
+
+            Payload::ElementSection(s) => {
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Element.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
+            }
+
+            Payload::DataCountSection { range, .. } => {
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::DataCount.into(),
+                    &wasm[range.start..range.end],
+                ));
             }
 
             Payload::CodeSectionStart { range, .. } => {
@@ -136,34 +236,90 @@ fn add_func_export(wasm: &[u8], export_name: &str, func_index: u32) -> Result<Ve
                 code_section_end = Some(body.range().end);
             }
 
-            Payload::End(_) => {}
+            Payload::DataSection(s) => {
+                // Flush code section before data, because code must stay before data.
+                if let (Some(start), Some(end)) = (code_section_start.take(), code_section_end.take()) {
+                    emitted.push(raw_section(
+                        wasm_encoder::SectionId::Code.into(),
+                        &wasm[start..end],
+                    ));
+                }
+
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Data.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
+            }
+
+            Payload::TagSection(s) => {
+                // Flush code section before tag too, in case tag comes after code/data in this file.
+                if let (Some(start), Some(end)) = (code_section_start.take(), code_section_end.take()) {
+                    emitted.push(raw_section(
+                        wasm_encoder::SectionId::Code.into(),
+                        &wasm[start..end],
+                    ));
+                }
+
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Tag.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
+            }
+
+            Payload::CustomSection(s) => {
+                emitted.push(raw_section(
+                    wasm_encoder::SectionId::Custom.into(),
+                    &wasm[s.range().start..s.range().end],
+                ));
+            }
 
             _ => {}
         }
     }
 
-    if !found_export_section {
-        let mut exports = ExportSection::new();
-        exports.export(export_name, ExportKind::Func, func_index);
-        module.section(&exports);
+    // Flush code section if it was present and not yet emitted.
+    if let (Some(start), Some(end)) = (code_section_start.take(), code_section_end.take()) {
+        emitted.push(raw_section(
+            wasm_encoder::SectionId::Code.into(),
+            &wasm[start..end],
+        ));
     }
 
-    if let (Some(start), Some(end)) = (code_section_start, code_section_end) {
-        module.section(&RawSection {
-            id: wasm_encoder::SectionId::Code.into(),
-            data: &wasm[start..end],
-        });
+    if !saw_export && !inserted_new_export {
+        let mut exports = ExportSection::new();
+        exports.export(export_name, export_kind(new_kind), new_index);
+        rebuilt_exports = exports;
+        emitted.push(EmittedSection::NewExport);
+    }
+
+    let mut module = Module::new();
+
+    for section in emitted {
+        match section {
+            EmittedSection::Raw { id, data } => {
+                module.section(&RawSection { id, data });
+            }
+            EmittedSection::NewExport => {
+                module.section(&rebuilt_exports);
+            }
+        }
     }
 
     Ok(module.finish())
 }
 
-trait RangeSlice {
-    fn slice<'a>(&self, bytes: &'a [u8]) -> &'a [u8];
+fn raw_section<'a>(id: u8, data: &'a [u8]) -> EmittedSection<'a> {
+    EmittedSection::Raw { id, data }
 }
 
-impl RangeSlice for std::ops::Range<usize> {
-    fn slice<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
-        &bytes[self.start..self.end]
-    }
+fn should_insert_export_before(payload: &Payload<'_>) -> bool {
+    matches!(
+        payload,
+        Payload::StartSection { .. }
+            | Payload::ElementSection(_)
+            | Payload::DataCountSection { .. }
+            | Payload::CodeSectionStart { .. }
+            | Payload::DataSection(_)
+            | Payload::TagSection(_)
+    )
 }
