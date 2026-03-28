@@ -36,10 +36,32 @@ fn main() -> Result<()> {
         "usage: add-wasm-export <in.wasm> <out.wasm> <export-name> <func|global> <target-name>",
     )?;
 
+    let optional_arg = args.next();
+    let optional = if optional_arg.is_some() {
+        let optional_str = optional_arg.unwrap();
+        if optional_str == "optional" {
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     let wasm = fs::read(&input).with_context(|| format!("failed to read {input}"))?;
 
     let target_index = find_named_target(&wasm, kind, &target_name)
-        .with_context(|| format!("could not find {kind:?} named {target_name:?}"))?;
+        .with_context(|| format!("could not find {kind:?} named {target_name:?}"));
+
+    let target_index = if optional {
+        if let Err(_err) = target_index {
+            println!("export {:?} not found, skipped", export_name);
+            return Ok(());
+        }
+        target_index.unwrap()
+    } else {
+        target_index?
+    };
 
     let rewritten = add_export(&wasm, &export_name, kind, target_index)?;
     wasmparser::validate(&rewritten).context("rewritten wasm is invalid")?;
